@@ -211,7 +211,7 @@ def predict_img_with_smooth_windowing(input_img,
                                       stride,
                                       padding: Padding,
                                       prediction_fn: Callable,
-                                      batch_size = 1):
+                                      batch_size=1):
     """
     Apply the `pred_func` function to square patches of the image, and overlap
     the predictions to merge them smoothly.
