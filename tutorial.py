@@ -21,7 +21,7 @@ def predict_same(small_img_patches):
 model = DummyModel()
 padding = AllAroundPadding(pad_repeat=2)
 dummy_image = np.random.randint(0, 255, (1000, 1000))
-#dummy_image = np.array(Image.open("images/6100_1_3.jpg"))
+dummy_image = np.array(Image.open("images/6100_1_3.jpg"))
 dtype = dummy_image.dtype
 plt.imshow(dummy_image)
 plt.show()
