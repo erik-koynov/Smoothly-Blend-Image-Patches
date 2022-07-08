@@ -1,7 +1,8 @@
 # MIT License
 # Copyright (c) 2022
 # Erik Koynov
-from typing import Sized
+from typing import List, Tuple
+import numpy as np
 
 def calculate_padding_size(dimension_size: int, window_size: int, stride: int) -> int:
     """
@@ -26,7 +27,17 @@ def calculate_padding_size(dimension_size: int, window_size: int, stride: int) -
             paddind_size = stride-paddind_size
     return paddind_size
 
-def split_into_batches(dataset: Sized, batch_size):
+def split_into_batches(dataset: List[Tuple[np.ndarray]], batch_size)->List[np.array]:
     """Split a list into batches"""
     for i in range(0, len(dataset), batch_size):
-        yield dataset[i:i + batch_size]
+        batch = list(zip(*dataset[i:i + batch_size])) # [(in11, in12,in13...),(in21,in22,...)]
+        yield collate_fn(batch) # the patches for the different inputs will be separated
+
+def collate_fn(batched_inputs: List[Tuple[np.array]])-> List[np.array]:
+    collated_inputs = []
+    for inputs in batched_inputs: # inputs is a Tuple of np.array (all inputs of one input category)
+        # assuming the inputs do NOT have a batch dimension!
+        collated_inputs.append(np.vstack([inputs]))
+    return collated_inputs
+
+

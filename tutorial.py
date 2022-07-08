@@ -12,15 +12,18 @@ from PIL import Image
 class DummyModel(nn.Module, BaseModel):
     def __init__(self, *args, **kwargs):
         super().__init__()
-    def forward(self, input_):
-        return input_
+    def forward(self, *input_):
+        return input_[0]
 
-def predict_same(small_img_patches):
+def predict_same(*small_img_patches):
+    return torch.Tensor(small_img_patches[0])
+
+def predict_same_single(small_img_patches):
     return torch.Tensor(small_img_patches)
 
 model = DummyModel()
 padding = AllAroundPadding(pad_repeat=2)
-dummy_image = np.random.randint(0, 255, (1000, 1000))
+#dummy_image = np.random.randint(0, 255, (1000, 1000))
 dummy_image = np.array(Image.open("images/6100_1_3.jpg"))
 dtype = dummy_image.dtype
 plt.imshow(dummy_image)
@@ -28,8 +31,10 @@ plt.show()
 
 print(dummy_image.shape)
 print(dummy_image[0])
-prediction = predict_img_with_smooth_windowing(dummy_image, 128, 64,
-                                  padding, lambda x: predict_same(x), batch_size=4)
+prediction = predict_img_with_smooth_windowing((dummy_image), 128, 64,
+                                  predict_same, padding,
+                                               batch_size=4,
+                                               apply_test_time_aug=True)
 print(prediction[0])
 print(dummy_image.mean())
 print(prediction.mean())
