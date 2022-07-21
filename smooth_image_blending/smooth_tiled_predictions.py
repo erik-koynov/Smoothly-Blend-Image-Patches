@@ -19,8 +19,8 @@ from smooth_image_blending.utils import split_into_batches
 import gc
 from smooth_image_blending.padding import Padding, AllAroundPadding
 from typing import Union, Tuple, List
-
-
+import matplotlib.pyplot as plt
+import torch
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
     PLOT_PROGRESS = True
@@ -124,7 +124,7 @@ def _rotate_mirror_undo(im_mirrs)->np.ndarray:
     return np.mean(origs, axis=0)
 
 
-def filter_predictions(patches: np.array,
+def filter_predictions(patches: List[np.array],
                        window_size: int,
                        spline_window_fn: Callable = spline_window):
     """
@@ -147,17 +147,22 @@ def filter_predictions(patches: np.array,
                                             spline_window_fn=spline_window_fn)
 
     gc.collect()
-    print("PATCHES: ",patches.shape)
-    print("SLINE: ",WINDOW_SPLINE_2D[:,:,None].shape)
-    if len(patches.shape)>3:
-        WINDOW_SPLINE_2D = WINDOW_SPLINE_2D[..., None]
-    patches = WINDOW_SPLINE_2D*patches
+    for i, patch in enumerate(patches):
+        print("PATCHES: ",patch.shape)
+        print("SLINE: ",WINDOW_SPLINE_2D[:,:,None].shape)
+        if len(patch.shape)>3:
+            WINDOW_SPLINE_2D = WINDOW_SPLINE_2D[..., None]
+        patch = WINDOW_SPLINE_2D*patch
+        patches[i] = patch
     gc.collect()
 
     return patches
 
 
-def apply_averaging_unpatchify(patches: np.array, window_size: tuple, stride: int, reconstructed_shape: tuple):
+def apply_averaging_unpatchify(patches: List[np.ndarray],
+                               window_size: tuple,
+                               stride: int,
+                               reconstructed_shape: tuple)->List[np.array]:
     """
     Merge tiled overlapping patches smoothly.
     reconstructed_shape : shape of the padded image before patchify.
@@ -169,23 +174,29 @@ def apply_averaging_unpatchify(patches: np.array, window_size: tuple, stride: in
 
     window_height = window_size[0]
     window_width = window_size[1]
+    reconstructed = []
+    gc.collect()
+    for patch in patches:
+        y = np.zeros(reconstructed_shape)
+        patch_idx = 0
+        for i in range(0, (height-window_height)+1, stride):
 
-    y = np.zeros(reconstructed_shape)
+            for j in range(0, (width-window_width)+1, stride):
 
-    patch_idx = 0
-    for i in range(0, width-window_height+1, stride):
-
-        for j in range(0, height-window_width+1, stride):
-
-            windowed_patch = patches[patch_idx]
-            y[i:i+window_height, j:j+window_width] += windowed_patch
-            patch_idx += 1
-
-    return y / (subdivisions ** 2)
+                windowed_patch = patch[patch_idx]
+                shape_to_fill = y[i:i+window_height, j:j+window_width].shape
+                print(f"shape to fill: {shape_to_fill}")
+                # plt.imshow(windowed_patch)
+                # plt.show()
+                y[i:i+window_height, j:j+window_width] += windowed_patch[:shape_to_fill[0],:shape_to_fill[1]]
+                patch_idx += 1
+        reconstructed.append(y / (subdivisions ** 2))
+    gc.collect()
+    return reconstructed
 
 def predict_on_patches(patches: List[tuple],
                        prediction_fn: Callable,
-                       batch_size: int = 1) -> np.array:
+                       batch_size: int = 1) -> List[np.array]:
     """
 
     :param patches: tuple containing a patch for all input images
@@ -195,8 +206,15 @@ def predict_on_patches(patches: List[tuple],
     """
     predictions = []
     for batch in split_into_batches(patches, batch_size):
-        predictions.append(prediction_fn(*batch).detach().to('cpu').numpy())
-    return np.vstack(predictions)
+        prediction = prediction_fn(*batch)#.detach().to('cpu').numpy()
+
+        if isinstance(prediction, torch.Tensor):
+            prediction = prediction.detach().to('cpu').numpy(),
+        # plt.imshow(prediction.squeeze())
+        # plt.show()
+        predictions.append(prediction)
+    predictions = list(zip(*predictions)) # if multiple predictions-> [(1,1,1,1,1),(2,2,2,2,2,)]
+    return [np.vstack(pred) for pred in predictions]
 
 def apply_patchify(image, window_size: tuple, stride: int) -> list:
     """
@@ -239,7 +257,7 @@ def predict_img_with_smooth_windowing(input_img: Union[Tuple[np.ndarray], np.nda
     http://blog.kaggle.com/2017/05/09/dstl-satellite-imagery-competition-3rd-place-winners-interview-vladimir-sergey/
     """
     if padding is None:
-        padding = AllAroundPadding()
+        padding = AllAroundPadding(pad_repeat=2)
 
     if isinstance(input_img, np.ndarray):
         input_img = (input_img,)
@@ -272,39 +290,37 @@ def predict_img_with_smooth_windowing(input_img: Union[Tuple[np.ndarray], np.nda
         #print("Means after patchify: ", [p[0].mean() for p in patches])
 
         # 3. make predictions on all patches (all their augmentations)
-        patches: np.ndarray = predict_on_patches(patches, prediction_fn, batch_size=batch_size) # one output per augmented img
+        patches: List[np.ndarray] = predict_on_patches(patches, prediction_fn, batch_size=batch_size) # n outputs per augmented input images*
 
-        if len(patches.shape) > 3:
-            output_channels = patches.shape[-1]
+        if len(patches[0].shape) > 3:
+            output_channels = patches[0].shape[-1]
             reconstruction_shape += (output_channels,)
-        print(f"Shape after prediction: {patches.shape}")
+        print(f"Shape after prediction: {patches[0].shape}")
         #print("Means after prediction: ", [p.mean() for p in patches])
 
         # 4. apply filtering to each patch
-        patches = filter_predictions(patches, window_size, spline_window_fn=spline_window_fn)
+        patches: List[np.ndarray] = filter_predictions(patches, window_size, spline_window_fn=spline_window_fn)
 
         #print("Means after filtering: ", [p.mean() for p in patches])
 
         # 5. reconstruct the whole image from the processed patches
-        one_padded_result = apply_averaging_unpatchify(patches,
+        one_padded_result: List[np.ndarray] = apply_averaging_unpatchify(patches,
                                                        (window_size, window_size, shape[-1]),
                                                        stride,
                                                        reconstruction_shape)
-        print(f"Shape after averaging: {one_padded_result.shape}")
-        print("Mean after averaging: ", one_padded_result.mean())
+        print(f"Shape after averaging: {one_padded_result[0].shape}")
+        print("Mean after averaging: ", one_padded_result[0].mean())
 
         augmented_images[i] = one_padded_result
 
     # Merge after rotations:
     if apply_test_time_aug:
-        padded_result = _rotate_mirror_undo(augmented_images) # the avg of all predictions on the different tt augmentations
+        padded_result = []
+        for aug_images in augmented_images:
+            padded_result.append([_rotate_mirror_undo(aug_image) for aug_image in aug_images]) # the avg of all predictions on the different tt augmentations
     else:
-        padded_result = augmented_images[0]
+        padded_result = augmented_images
+    for i, prediction in enumerate(padded_result):
+        padded_result[i] = [padding.inverse_transform(pred) for pred in prediction ]
 
-    prediction = padding.inverse_transform(padded_result)
-
-    if PLOT_PROGRESS:
-        plt.imshow(prediction)
-        plt.title("Smoothly Merged Patches that were Tiled Tighter")
-        plt.show()
-    return prediction
+    return padded_result
