@@ -29,9 +29,40 @@ else:
     PLOT_PROGRESS = False
 
 
+def ground_truth_classes(y_true: np.ndarray, background_lbl = 0):
+    unique_labels = np.unique(y_true)
+    for lbl in unique_labels:
+        if lbl == background_lbl:
+            continue
+        yield lbl
 
 
+def get_max_overlap_lbl_generator(a, b, retrieve_overlap=False):
+    for lbl in ground_truth_classes(a):
+        lbl_mask = (a == lbl)
+        unique_pred_lbls, pred_lbls_counts = np.unique(b[lbl_mask], return_counts=True)
+        if retrieve_overlap:
+            predicted_lbl = int(unique_pred_lbls[pred_lbls_counts.argmax()])
+            if predicted_lbl == 0:
+                overlap = 0.
+            else:
+                overlap = (lbl_mask * (b == predicted_lbl)).sum() / lbl_mask.sum()
+            yield lbl, predicted_lbl, overlap
+        else:
+            print("HERE WE ARE IN LBL GENERATOR", lbl, int(unique_pred_lbls[pred_lbls_counts.argmax()]), overlap, retrieve_overlap)
+            yield lbl, int(unique_pred_lbls[pred_lbls_counts.argmax()])
 
+
+def max_overlap_labels(a, b, inverted=False):
+    if len(np.unique(a))==1 and np.unique(a)[0]==0:
+        return {}
+    overlap_dict = {}
+    for lbl, predicted_lbl, overlap in get_max_overlap_lbl_generator(a, b, retrieve_overlap=True):
+        if inverted:
+            overlap_dict[predicted_lbl] = [lbl, overlap]
+        else:
+            overlap_dict[lbl] = [predicted_lbl, overlap]
+    return overlap_dict
 
 def spline_window(window_size, power=2, signal: Callable = scipy.signal.windows.triang):
     """
@@ -126,6 +157,7 @@ def _rotate_mirror_undo(im_mirrs)->np.ndarray:
 
 def filter_predictions(patches: List[np.array],
                        window_size: int,
+                       exclude_from_filtering: List[bool] = None,
                        spline_window_fn: Callable = spline_window):
     """
     Create tiled overlapping patches.
@@ -145,11 +177,16 @@ def filter_predictions(patches: List[np.array],
     WINDOW_SPLINE_2D: np.array = _window_2D(window_size=window_size,
                                             power=2,
                                             spline_window_fn=spline_window_fn)
+    if exclude_from_filtering is None:
+        exclude_from_filtering = [False]*len(patches)
 
     gc.collect()
-    for i, patch in enumerate(patches):
+    for i, (patch, exclude) in enumerate(zip(patches, exclude_from_filtering)):
+        if exclude:
+            patches[i] = patch
+            continue
         print("PATCHES: ",patch.shape)
-        print("SLINE: ",WINDOW_SPLINE_2D[:,:,None].shape)
+        print("SLINE: ",WINDOW_SPLINE_2D[:, :, None].shape)
         if len(patch.shape)>3:
             WINDOW_SPLINE_2D = WINDOW_SPLINE_2D[..., None]
         patch = WINDOW_SPLINE_2D*patch
@@ -159,40 +196,90 @@ def filter_predictions(patches: List[np.array],
     return patches
 
 
-def apply_averaging_unpatchify(patches: List[np.ndarray],
+def next_patch_to_fill(window_size, stride, reconstructed_shape):
+    height = reconstructed_shape[0]
+    width = reconstructed_shape[1]
+
+    window_height = window_size[0]
+    window_width = window_size[1]
+
+    patch_idx = -1
+    for i in range(0, width-window_height+1, stride):
+
+        for j in range(0, height-window_width+1, stride):
+            patch_idx += 1
+            yield patch_idx, i, i+window_height, j, j+window_width
+
+
+def apply_instance_aware_unpatchify(patches: np.array,
                                window_size: tuple,
                                stride: int,
-                               reconstructed_shape: tuple)->List[np.array]:
+                               reconstructed_shape: tuple):
+    """
+    Merge tiled overlapping patches smoothly.
+    reconstructed_shape : shape of the padded image before patchify.
+    patches: n_patches x (patch_dimensions)
+    """
+
+    y = np.zeros(reconstructed_shape)
+
+    available = 0
+    for patch_idx, y_start, y_end, x_start, x_end in next_patch_to_fill(window_size, stride, reconstructed_shape):
+        windowed_patch = patches[patch_idx]
+        current_situation = y[y_start:y_end, x_start:x_end]
+        # lbl_c: lbl_n, ovrlp , from the viewpoint of current (1.0 overlap -> lbl_c is INSIDE lbl_b)
+        overlap_dict_current = max_overlap_labels(current_situation, windowed_patch)
+        # lbl_n: lbl_c, ovrlp , from the viewpoint of new  (1.0 overlap -> lbl_b is INSIDE lbl_c)
+        overlap_dict_new = max_overlap_labels(windowed_patch, current_situation)
+        for lbl, (other, overlap) in overlap_dict_new.items():
+            other_ = overlap_dict_current.get(other, None)
+            if other_ is None: # the other is a 0 which is not included in the dict
+                current_situation[(windowed_patch == lbl)] = available + 1
+                available += 1
+                continue
+            other_lbl = other_[0]
+            other_overlap = other_[1]
+            if overlap > 0.7: # new is covered to 70% with current
+                if other_overlap>0.3:
+                    current_situation[windowed_patch == lbl] = other
+                else: # probably the other is a misclassified mix of two / more touching instances
+                    current_situation[(windowed_patch == lbl)] = available + 1
+                    available += 1
+
+            # the highest amount of overlap pixels in other is covered by lbl
+            elif other_lbl == lbl: # the top overlap of the other is current
+                if other_overlap > 0.7:
+                    current_situation[windowed_patch == lbl] = other
+                # insufficient overlap on other -> create a separate instance
+                else:
+                    current_situation[(windowed_patch == lbl) & (current_situation != other)] = available+1
+                    available += 1
+            else: # if other is 0 or there is not enough overlap in both directions -> add a new instance
+                current_situation[(windowed_patch == lbl) & (current_situation != other)] = available + 1
+                available += 1
+
+    return y
+
+def apply_averaging_unpatchify(patches: np.array,
+                               window_size: tuple,
+                               stride: int,
+                               reconstructed_shape: tuple):
     """
     Merge tiled overlapping patches smoothly.
     reconstructed_shape : shape of the padded image before patchify.
     patches: n_patches x (patch_dimensions)
     """
     subdivisions = np.ceil(window_size[0]/stride)
-    height = reconstructed_shape[0]
-    width = reconstructed_shape[1]
 
-    window_height = window_size[0]
-    window_width = window_size[1]
-    reconstructed = []
-    gc.collect()
-    for patch in patches:
-        y = np.zeros(reconstructed_shape)
-        patch_idx = 0
-        for i in range(0, (height-window_height)+1, stride):
+    y = np.zeros(reconstructed_shape)
 
-            for j in range(0, (width-window_width)+1, stride):
 
-                windowed_patch = patch[patch_idx]
-                shape_to_fill = y[i:i+window_height, j:j+window_width].shape
-                print(f"shape to fill: {shape_to_fill}")
-                # plt.imshow(windowed_patch)
-                # plt.show()
-                y[i:i+window_height, j:j+window_width] += windowed_patch[:shape_to_fill[0],:shape_to_fill[1]]
-                patch_idx += 1
-        reconstructed.append(y / (subdivisions ** 2))
-    gc.collect()
-    return reconstructed
+    for patch_idx, y_start, y_end, x_start, x_end in next_patch_to_fill(window_size, stride, reconstructed_shape):
+        windowed_patch = patches[patch_idx]
+        y[y_start:y_end, x_start:x_end] += windowed_patch
+
+
+    return y / (subdivisions ** 2)
 
 def predict_on_patches(patches: List[tuple],
                        prediction_fn: Callable,
@@ -240,7 +327,9 @@ def predict_img_with_smooth_windowing(input_img: Union[Tuple[np.ndarray], np.nda
                                       padding: Padding = None,
                                       batch_size=1,
                                       spline_window_fn: Callable = spline_window,
-                                      apply_test_time_aug=True):
+                                      apply_test_time_aug=True,
+                                      exclude_from_filtering: List[bool] = None,
+                                      averaging_functions_list: List[Callable] = None):
     """
     Apply the `pred_func` function to square patches of the image, and overlap
     the predictions to merge them smoothly.
@@ -289,7 +378,7 @@ def predict_img_with_smooth_windowing(input_img: Union[Tuple[np.ndarray], np.nda
 
         #print("Means after patchify: ", [p[0].mean() for p in patches])
 
-        # 3. make predictions on all patches (all their augmentations)
+        # 3. make predictions on all patches (all their augmentations) POSSIBLE MULTIPLE OUTPUTS PER PATCH!
         patches: List[np.ndarray] = predict_on_patches(patches, prediction_fn, batch_size=batch_size) # n outputs per augmented input images*
 
         if len(patches[0].shape) > 3:
@@ -299,17 +388,22 @@ def predict_img_with_smooth_windowing(input_img: Union[Tuple[np.ndarray], np.nda
         #print("Means after prediction: ", [p.mean() for p in patches])
 
         # 4. apply filtering to each patch
-        patches: List[np.ndarray] = filter_predictions(patches, window_size, spline_window_fn=spline_window_fn)
+        patches: List[np.ndarray] = filter_predictions(patches, window_size, exclude_from_filtering, spline_window_fn=spline_window_fn, )
+
 
         #print("Means after filtering: ", [p.mean() for p in patches])
-
+        if averaging_functions_list is None:
+            averaging_functions_list = [apply_averaging_unpatchify]*len(patches)
         # 5. reconstruct the whole image from the processed patches
-        one_padded_result: List[np.ndarray] = apply_averaging_unpatchify(patches,
+        one_padded_result: List[np.ndarray] = [func(patch,
                                                        (window_size, window_size, shape[-1]),
                                                        stride,
-                                                       reconstruction_shape)
+                                                       reconstruction_shape) for patch, func in zip(patches, averaging_functions_list)]
+
+
         print(f"Shape after averaging: {one_padded_result[0].shape}")
-        print("Mean after averaging: ", one_padded_result[0].mean())
+        print(f"Shape after averaging: {one_padded_result[1].shape}")
+        print(f"Shape after averaging: {one_padded_result[2].shape}")
 
         augmented_images[i] = one_padded_result
 
