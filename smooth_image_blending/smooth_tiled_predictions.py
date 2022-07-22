@@ -37,27 +37,46 @@ def ground_truth_classes(y_true: np.ndarray, background_lbl = 0):
         yield lbl
 
 
-def get_max_overlap_lbl_generator(a, b, retrieve_overlap=False):
+def get_max_overlap_lbl_generator(a, b, retrieve_overlap=False, retrieve_list = False):
     for lbl in ground_truth_classes(a):
         lbl_mask = (a == lbl)
+        print(np.unique(b[lbl_mask], return_counts=True))
         unique_pred_lbls, pred_lbls_counts = np.unique(b[lbl_mask], return_counts=True)
+
+        print(unique_pred_lbls)
+
         if retrieve_overlap:
-            predicted_lbl = int(unique_pred_lbls[pred_lbls_counts.argmax()])
-            if predicted_lbl == 0:
-                overlap = 0.
-            else:
-                overlap = (lbl_mask * (b == predicted_lbl)).sum() / lbl_mask.sum()
-            yield lbl, predicted_lbl, overlap
+            if not retrieve_list:
+                predicted_lbl = int(unique_pred_lbls[pred_lbls_counts.argmax()])
+                if predicted_lbl == 0:
+                    overlap = 0.
+                else:
+                    overlap = (lbl_mask * (b == predicted_lbl)).sum() / lbl_mask.sum()
+                yield lbl, predicted_lbl, overlap
+            else: # have to retrieve a list of all overlapping labels and their overlaps (because there might be multiple tiny dots as lone labels that will get missed
+                unique_pred_lbls, pred_lbls_counts = list(
+                    zip(*sorted(zip(unique_pred_lbls, pred_lbls_counts), key=lambda x: x[1])))
+
+                predicted_lbls, overlaps = [],[]
+                for predicted_lbl in unique_pred_lbls:
+                    predicted_lbls.append(predicted_lbl)
+
+                    if predicted_lbl == 0:
+                        overlaps.append(0.)
+                    else:
+                        overlaps.append((lbl_mask * (b == predicted_lbl)).sum() / lbl_mask.sum())
+                yield lbl, predicted_lbls, overlaps
         else:
-            print("HERE WE ARE IN LBL GENERATOR", lbl, int(unique_pred_lbls[pred_lbls_counts.argmax()]), overlap, retrieve_overlap)
             yield lbl, int(unique_pred_lbls[pred_lbls_counts.argmax()])
 
 
-def max_overlap_labels(a, b, inverted=False):
+def max_overlap_labels(a, b, inverted=False, retrieve_list=False):
     if len(np.unique(a))==1 and np.unique(a)[0]==0:
         return {}
     overlap_dict = {}
-    for lbl, predicted_lbl, overlap in get_max_overlap_lbl_generator(a, b, retrieve_overlap=True):
+    for lbl, predicted_lbl, overlap in get_max_overlap_lbl_generator(a, b,
+                                                                     retrieve_overlap=True,
+                                                                     retrieve_list=retrieve_list):
         if inverted:
             overlap_dict[predicted_lbl] = [lbl, overlap]
         else:
@@ -227,11 +246,15 @@ def apply_instance_aware_unpatchify(patches: np.array,
     for patch_idx, y_start, y_end, x_start, x_end in next_patch_to_fill(window_size, stride, reconstructed_shape):
         windowed_patch = patches[patch_idx]
         current_situation = y[y_start:y_end, x_start:x_end]
+
         # lbl_c: lbl_n, ovrlp , from the viewpoint of current (1.0 overlap -> lbl_c is INSIDE lbl_b)
         overlap_dict_current = max_overlap_labels(current_situation, windowed_patch)
         # lbl_n: lbl_c, ovrlp , from the viewpoint of new  (1.0 overlap -> lbl_b is INSIDE lbl_c)
         overlap_dict_new = max_overlap_labels(windowed_patch, current_situation)
+
         for lbl, (other, overlap) in overlap_dict_new.items():
+
+
             other_ = overlap_dict_current.get(other, None)
             if other_ is None: # the other is a 0 which is not included in the dict
                 current_situation[(windowed_patch == lbl)] = available + 1
@@ -240,7 +263,7 @@ def apply_instance_aware_unpatchify(patches: np.array,
             other_lbl = other_[0]
             other_overlap = other_[1]
             if overlap > 0.7: # new is covered to 70% with current
-                if other_overlap>0.3:
+                if other_overlap > 0.5:
                     current_situation[windowed_patch == lbl] = other
                 else: # probably the other is a misclassified mix of two / more touching instances
                     current_situation[(windowed_patch == lbl)] = available + 1
@@ -259,6 +282,87 @@ def apply_instance_aware_unpatchify(patches: np.array,
                 available += 1
 
     return y
+
+
+
+def apply_instance_aware_unpatchify_V2(patches: np.array,
+                               window_size: tuple,
+                               stride: int,
+                               reconstructed_shape: tuple):
+    """
+    Merge tiled overlapping patches smoothly.
+    reconstructed_shape : shape of the padded image before patchify.
+    patches: n_patches x (patch_dimensions)
+    """
+
+    y = np.zeros(reconstructed_shape)
+
+    available = 0
+    for patch_idx, y_start, y_end, x_start, x_end in next_patch_to_fill(window_size, stride, reconstructed_shape):
+        windowed_patch = patches[patch_idx]
+        current_situation = y[y_start:y_end, x_start:x_end]
+        _, ax = plt.subplots(1,2)
+        ax[0].imshow(windowed_patch)
+        ax[0].set_title("NEW")
+        ax[1].imshow(current_situation)
+        ax[1].set_title("OLD, before update")
+
+        plt.show()
+        #lbl_c: lbl_n, ovrlp , from the viewpoint of current (1.0 overlap -> lbl_c is INSIDE lbl_n)
+        overlap_dict_current = max_overlap_labels(current_situation, windowed_patch, retrieve_list=True)
+        # lbl_n: lbl_c, ovrlp , from the viewpoint of new  (1.0 overlap -> lbl_n is INSIDE lbl_c)
+        overlap_dict_new = max_overlap_labels(windowed_patch, current_situation, retrieve_list=True)
+
+        for lbl, (others, overlaps) in overlap_dict_new.items():
+            if len(others)==1 and others[0]==0:
+                print("NEW IS NOT OVERLAPPED", overlaps[0], lbl)
+                current_situation[(windowed_patch == lbl)] = available + 1
+                available += 1
+                continue
+
+
+            for other, overlap in zip(others, overlaps):
+                if other ==0:
+                    continue
+                other_ = overlap_dict_current.get(other, None)
+                if other_ is None: # the other is a 0 which is not included in the dict
+                    print("OLD IS ONLY BACKGROUND")
+                    current_situation[(windowed_patch == lbl)] = available + 1
+                    available += 1
+                    continue
+                other_lbl: list = other_[0]
+                other_overlap: list = other_[1]
+
+
+
+                for other_overlap_, other_lbl_ in zip(other_overlap, other_lbl):
+                    if other_lbl_ != lbl:
+                        continue
+                    if overlap > 0.5: # new is covered to 70% with current
+                        if other_overlap_ <0.4 or other_overlap_ > 0.6: # if the new is come small insignificant dot, or is essentially the same object but of smaller scale
+                            print("NEW IS COVERED 70% with current and ")
+                            current_situation[windowed_patch == lbl] = other
+                        else: # probably the other is a misclassified mix of two / more touching instances
+                            print("Overlap is above 0.5 but the other's overlap is between 40% and 60%")
+                            current_situation[(windowed_patch == lbl)] = available + 1
+                            available += 1
+                            break # the overlaps are sorted in descending order, if the other's overlap is <=0.5 then there can be no further overlap > 0.5
+
+                    else: # if other is 0 or there is not enough overlap in both directions -> add a new instance
+                        current_situation[(windowed_patch == lbl) & (current_situation != other)] = available + 1
+                        available += 1
+                        break
+        _, ax = plt.subplots(1,2)
+        ax[0].imshow(current_situation)
+        ax[0].set_title("OLD, after update")
+        ax[1].imshow(y[y_start:y_end, x_start:x_end])
+        ax[1].set_title("OLD")
+        plt.show()
+    return y
+
+
+
+
 
 def apply_averaging_unpatchify(patches: np.array,
                                window_size: tuple,
