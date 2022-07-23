@@ -301,13 +301,13 @@ def apply_instance_aware_unpatchify_V2(patches: np.array,
     for patch_idx, y_start, y_end, x_start, x_end in next_patch_to_fill(window_size, stride, reconstructed_shape):
         windowed_patch = patches[patch_idx]
         current_situation = y[y_start:y_end, x_start:x_end]
-        _, ax = plt.subplots(1,2)
-        ax[0].imshow(windowed_patch)
-        ax[0].set_title("NEW")
-        ax[1].imshow(current_situation)
-        ax[1].set_title("OLD, before update")
-
-        plt.show()
+        # _, ax = plt.subplots(1,2)
+        # ax[0].imshow(windowed_patch)
+        # ax[0].set_title("NEW")
+        # ax[1].imshow(current_situation)
+        # ax[1].set_title("OLD, before update")
+        #
+        # plt.show()
         #lbl_c: lbl_n, ovrlp , from the viewpoint of current (1.0 overlap -> lbl_c is INSIDE lbl_n)
         overlap_dict_current = max_overlap_labels(current_situation, windowed_patch, retrieve_list=True)
         # lbl_n: lbl_c, ovrlp , from the viewpoint of new  (1.0 overlap -> lbl_n is INSIDE lbl_c)
@@ -320,6 +320,7 @@ def apply_instance_aware_unpatchify_V2(patches: np.array,
                 available += 1
                 continue
 
+            changed_once = False
 
             for other, overlap in zip(others, overlaps):
                 if other ==0:
@@ -338,26 +339,48 @@ def apply_instance_aware_unpatchify_V2(patches: np.array,
                 for other_overlap_, other_lbl_ in zip(other_overlap, other_lbl):
                     if other_lbl_ != lbl:
                         continue
-                    if overlap > 0.5: # new is covered to 70% with current
+                    if overlap>0.7:
+                        print("Way too much overlap: it has to be the same instance ")
+                        current_situation[windowed_patch == lbl] = other
+
+                    elif overlap > 0.5: # new is covered to 70% with current
                         if other_overlap_ <0.4 or other_overlap_ > 0.6: # if the new is come small insignificant dot, or is essentially the same object but of smaller scale
                             print("NEW IS COVERED 70% with current and ")
                             current_situation[windowed_patch == lbl] = other
                         else: # probably the other is a misclassified mix of two / more touching instances
                             print("Overlap is above 0.5 but the other's overlap is between 40% and 60%")
-                            current_situation[(windowed_patch == lbl)] = available + 1
-                            available += 1
-                            break # the overlaps are sorted in descending order, if the other's overlap is <=0.5 then there can be no further overlap > 0.5
+                            if changed_once:
+                                new_lbl = available
+                            else:
+                                available += 1
+                                new_lbl = available
 
+                            current_situation[(windowed_patch == lbl)] = new_lbl
+                            break # the overlaps are sorted in descending order, if the other's overlap is <=0.5 then there can be no further overlap > 0.5
+                    elif other_overlap_>0.7:
+                        if changed_once:
+                            new_lbl = available
+                        else:
+                            new_lbl = available+1
+                            available+=1
+                        current_situation[(windowed_patch == lbl)&((current_situation == other)|(current_situation == 0))] = new_lbl
+                        continue
                     else: # if other is 0 or there is not enough overlap in both directions -> add a new instance
-                        current_situation[(windowed_patch == lbl) & (current_situation != other)] = available + 1
-                        available += 1
+                        if changed_once:
+                            new_lbl = available
+                        else:
+                            available += 1
+                            new_lbl = available
+
+                        current_situation[(windowed_patch == lbl) & (current_situation != other)] = new_lbl
+
                         break
-        _, ax = plt.subplots(1,2)
-        ax[0].imshow(current_situation)
-        ax[0].set_title("OLD, after update")
-        ax[1].imshow(y[y_start:y_end, x_start:x_end])
-        ax[1].set_title("OLD")
-        plt.show()
+        # _, ax = plt.subplots(1,2)
+        # ax[0].imshow(current_situation)
+        # ax[0].set_title("OLD, after update")
+        # ax[1].imshow(y[y_start:y_end, x_start:x_end])
+        # ax[1].set_title("OLD")
+        # plt.show()
     return y
 
 
